@@ -1,0 +1,193 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: '1'
+    field.cattle.io/publicEndpoints: >-
+      [{"port":31198,"protocol":"TCP","serviceName":"chatbot:stt-service","allNodes":true}]
+  creationTimestamp: '2026-02-27T03:45:09Z'
+  generation: 4
+  managedFields:
+    - apiVersion: apps/v1
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:spec:
+          f:progressDeadlineSeconds: {}
+          f:revisionHistoryLimit: {}
+          f:selector: {}
+          f:strategy:
+            f:rollingUpdate:
+              .: {}
+              f:maxSurge: {}
+              f:maxUnavailable: {}
+            f:type: {}
+          f:template:
+            f:metadata:
+              f:labels:
+                .: {}
+                f:app: {}
+            f:spec:
+              f:containers:
+                k:{"name":"stt-api"}:
+                  .: {}
+                  f:command: {}
+                  f:env:
+                    .: {}
+                    k:{"name":"CUDA_VISIBLE_DEVICES"}:
+                      .: {}
+                      f:name: {}
+                      f:value: {}
+                    k:{"name":"NVIDIA_DRIVER_CAPABILITIES"}:
+                      .: {}
+                      f:name: {}
+                      f:value: {}
+                    k:{"name":"NVIDIA_VISIBLE_DEVICES"}:
+                      .: {}
+                      f:name: {}
+                      f:value: {}
+                  f:image: {}
+                  f:imagePullPolicy: {}
+                  f:name: {}
+                  f:resources:
+                    .: {}
+                    f:limits:
+                      .: {}
+                      f:nvidia.com/gpu: {}
+                    f:requests:
+                      .: {}
+                      f:nvidia.com/gpu: {}
+                  f:securityContext:
+                    .: {}
+                    f:privileged: {}
+                  f:terminationMessagePath: {}
+                  f:terminationMessagePolicy: {}
+              f:dnsPolicy: {}
+              f:imagePullSecrets:
+                .: {}
+                k:{"name":"harbor"}: {}
+              f:nodeName: {}
+              f:restartPolicy: {}
+              f:runtimeClassName: {}
+              f:schedulerName: {}
+              f:securityContext: {}
+              f:terminationGracePeriodSeconds: {}
+      manager: dashboard-api
+      operation: Update
+      time: '2026-02-27T03:45:09Z'
+    - apiVersion: apps/v1
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:annotations:
+            .: {}
+            f:field.cattle.io/publicEndpoints: {}
+      manager: rancher
+      operation: Update
+      time: '2026-02-27T03:45:09Z'
+    - apiVersion: apps/v1
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:annotations:
+            f:deployment.kubernetes.io/revision: {}
+        f:status:
+          f:availableReplicas: {}
+          f:conditions:
+            .: {}
+            k:{"type":"Available"}:
+              .: {}
+              f:lastTransitionTime: {}
+              f:lastUpdateTime: {}
+              f:message: {}
+              f:reason: {}
+              f:status: {}
+              f:type: {}
+            k:{"type":"Progressing"}:
+              .: {}
+              f:lastTransitionTime: {}
+              f:lastUpdateTime: {}
+              f:message: {}
+              f:reason: {}
+              f:status: {}
+              f:type: {}
+          f:observedGeneration: {}
+          f:readyReplicas: {}
+          f:replicas: {}
+          f:updatedReplicas: {}
+      manager: kube-controller-manager
+      operation: Update
+      subresource: status
+      time: '2026-02-27T07:35:53Z'
+  name: stt-api
+  namespace: chatbot
+  resourceVersion: '188786620'
+  uid: 5bf4e68e-8f30-4ffe-b89c-d14ab7eb20d9
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: stt-api
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: stt-api
+    spec:
+      containers:
+        - command:
+            - python3
+            - server.py
+          env:
+            - name: CUDA_VISIBLE_DEVICES
+              value: '1'
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: '1'
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: all
+          image: docker-registry.vnpttiengiang.vn/chatbot/speech-to-text:latest
+          imagePullPolicy: Always
+          name: stt-api
+          resources:
+            limits:
+              nvidia.com/gpu: '1'
+            requests:
+              nvidia.com/gpu: '1'
+          securityContext:
+            privileged: true
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      imagePullSecrets:
+        - name: harbor
+      nodeName: aichatbot
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+status:
+  availableReplicas: 1
+  conditions:
+    - lastTransitionTime: '2026-02-27T03:45:09Z'
+      lastUpdateTime: '2026-02-27T03:45:10Z'
+      message: ReplicaSet "stt-api-6c68fdc5b6" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: 'True'
+      type: Progressing
+    - lastTransitionTime: '2026-02-27T07:35:53Z'
+      lastUpdateTime: '2026-02-27T07:35:53Z'
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: 'True'
+      type: Available
+  observedGeneration: 4
+  readyReplicas: 1
+  replicas: 1
+  updatedReplicas: 1

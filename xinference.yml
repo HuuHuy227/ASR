@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xinference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xinference
+  template:
+    metadata:
+      labels:
+        app: xinference
+    spec:
+      runtimeClassName: nvidia
+      containers:
+      - name: xinference
+        image: docker-registry.vnpttiengiang.vn/chatbot/xinference:latest
+        command:
+          - /bin/bash
+          - -c
+          - "xinference-local --host 0.0.0.0 --port 9997 & sleep 20 && /opt/inference/xinference-entrypoint.sh"
+        env:
+          - name: CUDA_VISIBLE_DEVICES
+            value: '0'
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: '0'
+          - name: NVIDIA_DRIVER_CAPABILITIES
+            value: all
+      nodeName: aichatbot
+      imagePullSecrets:
+        - name: harbor
+      restartPolicy: Always
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: xinference
+# spec:
+#   selector:
+#     app: xinference
+#   ports:
+#     - protocol: TCP
+#       port: 9995
+#       targetPort: 9997
+#   type: NodePort

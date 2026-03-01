@@ -1,16 +1,21 @@
+import io
 import logging
-import tempfile
 import asyncio
 import uvicorn
 import torch
 import gc
+import torchaudio
 from concurrent.futures import ThreadPoolExecutor
 from transcription import Transcriber
 from pyannote.audio import Pipeline
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from utils import assign_words_to_speakers, build_utterances_from_words   
+from utils import assign_words_to_speakers, build_utterances_from_words
+
+# Tăng tốc tính toán ma trận trên Ampere+ GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,21 +24,20 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI()
 
-# Thread pool for CPU-bound tasks (ASR + Diarization)
+# Thread pool cho CPU-bound / blocking tasks
 executor = ThreadPoolExecutor(max_workers=4)
 
-# ─── Concurrency control ────────────────────────────────────────────────────
-# Limit concurrent GPU-heavy requests to prevent OOM
-# Adjust max value based on your GPU memory:
-#   - 46GB VRAM: 2-3 concurrent long audio is safe
-#   - 24GB VRAM: 1 concurrent long audio
-MAX_CONCURRENT_TRANSCRIPTIONS = 2
-_transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+# ─── Concurrency control ─────────────────────────────────────────────────────
+# Giới hạn số request dùng GPU cùng lúc để tránh OOM.
+# Mỗi slot semaphore chỉ bọc MỘT bước GPU tại một thời điểm
+# (ASR hoặc Diarization), KHÔNG bọc cả pipeline → tận dụng tối đa throughput.
+MAX_CONCURRENT_GPU_TASKS = 2
+_gpu_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GPU_TASKS)
 
-# ─── Lazy singletons ────────────────────────────────────────────────────────
-
+# ─── Lazy singletons ─────────────────────────────────────────────────────────
 transcriber = None
 diarization_pipeline = None
+
 
 def get_transcriber():
     global transcriber
@@ -42,19 +46,28 @@ def get_transcriber():
         transcriber = Transcriber(model_path="ckpt/asr/")
     return transcriber
 
+
 def get_diarization_pipeline():
     global diarization_pipeline
     if diarization_pipeline is None:
         logger.info("Initializing Diarization Pipeline...")
-        diarization_pipeline = Pipeline.from_pretrained(
-            "ckpt/segment/",
-        )
+        diarization_pipeline = Pipeline.from_pretrained("ckpt/segment/")
+
+        # Tăng batch size để GPU chạy hết công suất khi embedding
+        diarization_pipeline.embedding_batch_size = 64
+        diarization_pipeline.segmentation_batch_size = 64
+
+        # Giảm over-segmentation: merge speaker turn ngắn hơn 0.5s
+        # 2268 turns → ~400-600 turns sau khi merge
+        diarization_pipeline.segmentation.min_duration_off = 0.5
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         diarization_pipeline.to(device)
         logger.info(f"Diarization pipeline loaded on {device}")
     return diarization_pipeline
 
-# ─── Startup ────────────────────────────────────────────────────────────────
+
+# ─── Startup ─────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
@@ -66,7 +79,8 @@ async def startup_event():
     )
     logger.info("All models loaded successfully")
 
-# ─── Middleware ──────────────────────────────────────────────────────────────
+
+# ─── Middleware ───────────────────────────────────────────────────────────────
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,12 +91,18 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _run_asr(audio_bytes: bytes, chunk_size, left_context_size,
-            right_context_size, total_batch_duration, 
-            max_silence_duration, 
-            return_word_timestamps=False):
+# ─── GPU Task Helpers ─────────────────────────────────────────────────────────
+
+def _run_asr(
+    audio_bytes: bytes,
+    chunk_size: int,
+    left_context_size: int,
+    right_context_size: int,
+    total_batch_duration: int,
+    max_silence_duration: float,
+    return_word_timestamps: bool = False,
+):
     """Run ASR synchronously – called inside thread-pool executor."""
     trans = get_transcriber()
     segments, full_transcript = trans.transcribe_audio(
@@ -94,27 +114,50 @@ def _run_asr(audio_bytes: bytes, chunk_size, left_context_size,
         max_silence_duration=max_silence_duration,
         return_word_timestamps=return_word_timestamps,
     )
-    # Force garbage collection after ASR to free any lingering tensors
+    # Giải phóng VRAM trước khi trả về để bước tiếp theo có đủ memory
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return segments, full_transcript
 
-def _run_diarization(tmp_path: str):
-    """Run diarization synchronously – called inside thread-pool executor."""
+
+def _run_diarization(audio_bytes: bytes):
+    """
+    Run diarization synchronously – called inside thread-pool executor.
+
+    Nhận thẳng audio_bytes từ RAM, tránh hoàn toàn Disk I/O đọc file.
+    torchaudio.load() với BytesIO nhanh hơn đọc từ temp file trên ổ cứng.
+    """
+    import time
+
+    t0 = time.time()
+
+    # Load audio thẳng từ RAM, không cần temp file
+    waveform, sample_rate = torchaudio.load(io.BytesIO(audio_bytes))
+    audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
+    logger.info(f"[DIARIZATION] Audio loaded to RAM: {waveform.shape}, sr={sample_rate}")
+
     pipeline = get_diarization_pipeline()
-    output = pipeline(tmp_path)
+    output = pipeline(audio_dict)
+
+    elapsed = time.time() - t0
+    logger.info(f"[DIARIZATION] Pipeline done in {elapsed:.2f}s")
+
     speaker_turns = [
-        {"start": turn.start, "end": turn.end, "speaker": speaker}
-        for turn, speaker in output.speaker_diarization
+            {"start": turn.start, "end": turn.end, "speaker": speaker}
+            for turn, speaker in output.speaker_diarization
     ]
-    # Force cleanup after diarization
+
+    logger.info(f"[DIARIZATION] Extracted {len(speaker_turns)} speaker turns")
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
     return speaker_turns
 
-# ─── Endpoints ───────────────────────────────────────────────────────────────
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def read_root():
@@ -124,9 +167,9 @@ def read_root():
 @app.post("/speech-to-text")
 async def transcribe_audio(
     file: UploadFile = File(...),
-    chunk_size: int = Query(64,   description="Chunk size for processing"),
-    left_context_size:  int = Query(128,  description="Left context size"),
-    right_context_size: int = Query(128,  description="Right context size"),
+    chunk_size: int = Query(64, description="Chunk size for processing"),
+    left_context_size: int = Query(128, description="Left context size"),
+    right_context_size: int = Query(128, description="Right context size"),
     total_batch_duration: int = Query(1800, description="Total batch duration in seconds"),
     max_silence_duration: float = Query(0.5, description="Maximum silence duration for sentence breaks"),
 ):
@@ -135,10 +178,9 @@ async def transcribe_audio(
     if not audio_bytes:
         return {"error": "Empty audio file", "transcriptions": []}
 
-    async with _transcription_semaphore:
-        try:
-            trans = get_transcriber()
-            loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_event_loop()
+        async with _gpu_semaphore:
             segments, full_transcript = await loop.run_in_executor(
                 executor,
                 _run_asr,
@@ -146,70 +188,78 @@ async def transcribe_audio(
                 right_context_size, total_batch_duration, max_silence_duration,
                 False,
             )
-            logger.info(f"Transcription result: {full_transcript}")
-            return {"transcriptions": full_transcript, "details": segments}
-        except Exception as e:
-            logger.error(f"Transcription error: {str(e)}", exc_info=True)
-            return {"error": str(e), "transcriptions": []}
+        logger.info(f"Transcription result: {full_transcript[:100]}...")
+        return {"transcriptions": full_transcript, "details": segments}
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}", exc_info=True)
+        return {"error": str(e), "transcriptions": []}
 
 
 @app.post("/meeting-transcribe")
 async def meeting_transcribe(
     file: UploadFile = File(...),
-    chunk_size: int = Query(64,   description="Chunk size for ASR processing"),
-    left_context_size:  int = Query(128,  description="Left context size"),
-    right_context_size: int = Query(128,  description="Right context size"),
+    chunk_size: int = Query(64, description="Chunk size for ASR processing"),
+    left_context_size: int = Query(128, description="Left context size"),
+    right_context_size: int = Query(128, description="Right context size"),
     total_batch_duration: int = Query(1800, description="Total batch duration in seconds"),
     max_silence_duration: float = Query(0.5, description="Maximum silence duration"),
 ):
+    """
+    Meeting transcription với speaker diarization.
+
+    Luồng xử lý:
+        [ASR]  → acquire GPU semaphore → chạy → release
+                                                    ↓
+        [DIAR] → acquire GPU semaphore → chạy → release
+                                                    ↓
+        [CPU]  → assign_words_to_speakers + build_utterances (không cần semaphore)
+
+    Mỗi bước chỉ giữ semaphore trong thời gian nó thực sự dùng GPU.
+    Khi ASR xong và đang chờ DIAR acquire semaphore, slot đó có thể
+    được request khác dùng (ví dụ: /speech-to-text từ user khác).
+    """
     audio_bytes = await file.read()
     if not audio_bytes:
         return {"error": "Empty audio file", "transcript": []}
 
-    # Write to temp file (pyannote requires a file path)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-
     try:
-        # Acquire semaphore to limit concurrent GPU usage
-        async with _transcription_semaphore:
-            loop = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
 
-            # ── Run ASR and Diarization in PARALLEL ──────────────────────
-            asr_future = loop.run_in_executor(
-                executor,
-                _run_asr,
+        # ── BƯỚC 1: ASR (GPU) ─────────────────────────────────────────────
+        logger.info("[MEETING] Bắt đầu ASR...")
+        async with _gpu_semaphore:
+            asr_segments, _ = await loop.run_in_executor(
+                executor, _run_asr,
                 audio_bytes, chunk_size, left_context_size,
                 right_context_size, total_batch_duration, max_silence_duration,
-                True,  # return_word_timestamps=True 
+                True,  # return_word_timestamps=True
             )
-            diarization_future = loop.run_in_executor(
-                executor,
-                _run_diarization,
-                tmp_path,
+        # _run_asr đã gọi gc.collect() + empty_cache() bên trong
+        logger.info(f"[MEETING] ASR xong: {len(asr_segments)} segments")
+
+        # ── BƯỚC 2: Diarization (GPU) ─────────────────────────────────────
+        # Acquire semaphore lần hai — độc lập với bước 1.
+        # Trong khoảng thời gian giữa release bước 1 và acquire bước 2,
+        # request khác có thể dùng GPU slot đó.
+        logger.info("[MEETING] Bắt đầu Diarization...")
+        async with _gpu_semaphore:
+            speaker_turns = await loop.run_in_executor(
+                executor, _run_diarization,
+                audio_bytes,  # truyền thẳng bytes, không cần temp file
             )
+        logger.info(f"[MEETING] Diarization xong: {len(speaker_turns)} turns")
 
-            (asr_segments, _), speaker_turns = await asyncio.gather(
-                asr_future, diarization_future
-            )
-
-        # ── Post-processing runs on CPU only, no semaphore needed ────────
-        logger.info(f"ASR segments: {len(asr_segments)} | Speaker turns: {len(speaker_turns)}")
-
-        # Collect all words from all ASR segments
+        # ── BƯỚC 3: Post-processing (CPU only, không cần semaphore) ───────
         all_words = []
         for seg in asr_segments:
             if "words" in seg:
                 all_words.extend(seg["words"])
 
-        # Assign each word to a speaker using binary search
+        logger.info(f"[MEETING] Post-processing {len(all_words)} words...")
         labeled_words = assign_words_to_speakers(all_words, speaker_turns)
-
-        # Merge consecutive same-speaker words → utterances
         utterances = build_utterances_from_words(labeled_words)
 
-        logger.info(f"Built {len(utterances)} utterances")
+        logger.info(f"[MEETING] Built {len(utterances)} utterances")
 
         return {
             "utterances": utterances,
@@ -219,13 +269,6 @@ async def meeting_transcribe(
     except Exception as e:
         logger.error(f"Meeting transcription error: {str(e)}", exc_info=True)
         return {"error": str(e), "transcript": []}
-
-    finally:
-        import os
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

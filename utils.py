@@ -197,16 +197,26 @@ def assign_words_to_speakers(words: list, speaker_turns: list) -> list:
 
             # Priority 3: Nearest turn fallback
             if best_speaker is None:
+                # nearest_dist = float("inf")
+                # # Check idx and idx+1 (the two closest turns by start time)
+                # for check_idx in range(max(0, idx), min(n_turns, idx + 2)):
+                #     dist = min(
+                #         abs(word_mid_int - turn_starts_ms[check_idx]),
+                #         abs(word_mid_int - turn_ends_ms[check_idx]),
+                #     )
+                #     if dist < nearest_dist:
+                #         nearest_dist = dist
+                #         best_speaker = turn_speakers[check_idx]
+
                 nearest_dist = float("inf")
-                # Check idx and idx+1 (the two closest turns by start time)
-                for check_idx in range(max(0, idx), min(n_turns, idx + 2)):
-                    dist = min(
-                        abs(word_mid_int - turn_starts_ms[check_idx]),
-                        abs(word_mid_int - turn_ends_ms[check_idx]),
-                    )
+                for check_idx in range(max(0, idx - 1), min(n_turns, idx + 2)):
+                    dist_to_start = abs(word_mid_int - turn_starts_ms[check_idx])
+                    dist_to_end   = abs(word_mid_int - turn_ends_ms[check_idx])
+                    dist = min(dist_to_start, dist_to_end)
                     if dist < nearest_dist:
                         nearest_dist = dist
                         best_speaker = turn_speakers[check_idx]
+
                 # Also check idx-1 if it exists
                 if idx - 1 >= 0:
                     dist = abs(word_mid_int - turn_ends_ms[idx - 1])

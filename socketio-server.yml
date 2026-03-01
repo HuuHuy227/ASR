@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: socketio-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: socketio-server
+  template:
+    metadata:
+      labels:
+        app: socketio-server
+    spec:
+      containers:
+      - name: socketio-server
+        image: docker-registry.vnpttiengiang.vn/chatbot/chatbot-fastapi:latest
+        command:
+          - "uvicorn"
+          - "socketio_server:app"  
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8001"
+          - "--reload" 
+        envFrom:
+          - configMapRef:
+              name: chatbot-config
+        imagePullPolicy: Always
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: harbor
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: socketio-service
+spec:
+  ports:
+    - protocol: TCP
+      port: 8001
+      nodePort: 31496
+      targetPort: 8001
+  selector:
+    app: socketio-server
+  type: NodePort
