@@ -9,8 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 from transcription import Transcriber
 from pyannote.audio import Pipeline
 from fastapi import FastAPI, File, UploadFile, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+import json
 from utils import assign_words_to_speakers, build_utterances_from_words
 
 # Tăng tốc tính toán ma trận trên Ampere+ GPUs
@@ -194,7 +196,6 @@ async def transcribe_audio(
         logger.error(f"Transcription error: {str(e)}", exc_info=True)
         return {"error": str(e), "transcriptions": []}
 
-
 @app.post("/meeting-transcribe")
 async def meeting_transcribe(
     file: UploadFile = File(...),
@@ -270,6 +271,90 @@ async def meeting_transcribe(
         logger.error(f"Meeting transcription error: {str(e)}", exc_info=True)
         return {"error": str(e), "transcript": []}
 
+@app.post("/stream-meeting-transcribe")
+async def stream_transcribe(
+    file: UploadFile = File(...),
+    chunk_size: int = Query(64),
+    left_context_size: int = Query(128),
+    right_context_size: int = Query(128),
+    total_batch_duration: int = Query(1800),
+    max_silence_duration: float = Query(0.5),
+):
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        async def empty_gen():
+            yield json.dumps({"status": "failed", "error": "Empty audio file"}) + "\n"
+        return StreamingResponse(empty_gen(), media_type="application/x-ndjson")
+
+    async def process_generator():
+        try:
+            loop = asyncio.get_running_loop()  # get_event_loop() deprecated Python 3.10+
+
+            # ── BƯỚC 1: ASR ──────────────────────────────────────────────
+            yield json.dumps({"status": "processing", "step": "ASR", "percent": 5}) + "\n"
+            logger.info("[STREAM] Bắt đầu ASR...")
+
+            async with _gpu_semaphore:
+                # FIX 1: truyền đủ tham số + unpack tuple (segments, full_transcript)
+                asr_segments, _ = await loop.run_in_executor(
+                    executor, _run_asr,
+                    audio_bytes, chunk_size, left_context_size,
+                    right_context_size, total_batch_duration, max_silence_duration,
+                    True,  # return_word_timestamps=True
+                )
+            logger.info(f"[STREAM] ASR xong: {len(asr_segments)} segments")
+            yield json.dumps({"status": "processing", "step": "ASR", "percent": 45}) + "\n"
+
+            # ── BƯỚC 2: Diarization ───────────────────────────────────────
+            yield json.dumps({"status": "processing", "step": "Diarization", "percent": 50}) + "\n"
+            logger.info("[STREAM] Bắt đầu Diarization...")
+
+            async with _gpu_semaphore:
+                speaker_turns = await loop.run_in_executor(
+                    executor, _run_diarization,
+                    audio_bytes,
+                )
+            logger.info(f"[STREAM] Diarization xong: {len(speaker_turns)} turns")
+            yield json.dumps({"status": "processing", "step": "Diarization", "percent": 88}) + "\n"
+
+            # ── BƯỚC 3: Post-processing ───────────────────────────────────
+            yield json.dumps({"status": "processing", "step": "Post-processing", "percent": 90}) + "\n"
+
+            # FIX 2: extract all_words từ asr_segments trước khi dùng
+            all_words = []
+            for seg in asr_segments:
+                if "words" in seg:
+                    all_words.extend(seg["words"])
+            logger.info(f"[STREAM] Post-processing {len(all_words)} words...")
+
+            labeled_words = assign_words_to_speakers(all_words, speaker_turns)
+            utterances = build_utterances_from_words(labeled_words)
+            logger.info(f"[STREAM] Built {len(utterances)} utterances")
+
+            yield json.dumps({
+                "status": "completed",
+                "percent": 100,
+                "result": {
+                    "utterances": utterances,
+                    "speaker_turns": speaker_turns,
+                }
+            }) + "\n"
+
+        except Exception as e:
+            logger.error(f"[STREAM] Error: {e}", exc_info=True)
+            yield json.dumps({"status": "failed", "error": str(e)}) + "\n"
+
+    # FIX 3: thêm headers chống buffer proxy/nginx/uvicorn
+    headers = {
+        "X-Accel-Buffering": "no",   # tắt nginx buffering
+        "Cache-Control":     "no-cache",
+        "Connection":        "keep-alive",
+    }
+    return StreamingResponse(
+        process_generator(),
+        media_type="application/x-ndjson",
+        headers=headers,
+    )
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
